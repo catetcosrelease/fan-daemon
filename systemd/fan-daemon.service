@@ -1,0 +1,23 @@
+[Unit]
+Description=Dynamic fan control (CPU/SSD curves)
+After=systemd-modules-load.service lm-sensors.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/fan-daemon
+ExecStart=/usr/local/sbin/fan-daemon.sh
+# "+" skips the sandbox: the fan goes to full speed even if ExecStart fails to start.
+ExecStopPost=+/usr/local/sbin/fan-daemon.sh --failsafe
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
