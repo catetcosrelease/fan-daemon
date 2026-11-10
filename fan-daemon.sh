@@ -13,6 +13,7 @@ FAN_CHIP=${FAN_CHIP:-it8771}
 PWM_CHANNEL=${PWM_CHANNEL:-2}
 CPU_MIN_C=${CPU_MIN_C:-50}     # at or below this temperature: PWM_MIN
 CPU_MAX_C=${CPU_MAX_C:-85}     # at or above this temperature: PWM_MAX
+CPU_CRIT_C=${CPU_CRIT_C:-90}   # a single raw reading this high: PWM_MAX at once
 SSD_MIN_C=${SSD_MIN_C:-45}
 SSD_MAX_C=${SSD_MAX_C:-70}
 PWM_MIN=${PWM_MIN:-80}
@@ -23,6 +24,7 @@ HYSTERESIS=${HYSTERESIS:-8}    # only go down if the target is at least this far
 INTERVAL=${INTERVAL:-10}       # seconds between recalculations
 LOG_EVERY=${LOG_EVERY:-60}     # cycles between status lines in the journal
 STALL_CYCLES=${STALL_CYCLES:-3}  # cycles at 0 RPM before the fan counts as stopped
+BOOST_FILE=${BOOST_FILE:-/run/fan-daemon/boost}  # "<pwm> <expiry epoch>", written by fan-boost
 
 fatal() {
   echo "ERROR: $*" >&2
@@ -53,6 +55,27 @@ read_ssd() {
   REPLY=$max
 }
 
+# Median of three readings: a single spike (the CPU package and the SSD
+# controller jump 10-15 C in two seconds) never moves the fan.
+median3() {
+  local a=$1 b=$2 c=$3 t
+  [ "$a" -gt "$b" ] && { t=$a; a=$b; b=$t; }
+  [ "$b" -gt "$c" ] && { t=$b; b=$c; c=$t; }
+  [ "$a" -gt "$b" ] && { t=$a; a=$b; b=$t; }
+  REPLY=$b
+}
+
+# Boost floor from BOOST_FILE, 0 if missing, malformed or expired.
+read_boost() {
+  local p e now
+  REPLY=0
+  { read -r p e < "$BOOST_FILE"; } 2>/dev/null || return 0
+  [[ $p =~ ^[0-9]+$ && $e =~ ^[0-9]+$ ]] || return 0
+  now=${EPOCHSECONDS:-$(date +%s)}
+  [ "$now" -lt "$e" ] && REPLY=$(( p < PWM_MAX ? p : PWM_MAX ))
+  return 0
+}
+
 curve() {  # temperature(mC) min(C) max(C)
   local t=$1 lo=$(( $2 * 1000 )) hi=$(( $3 * 1000 ))
   if [ "$t" -le "$lo" ]; then
@@ -76,11 +99,12 @@ if [ "${1:-}" = "--failsafe" ]; then
   exit $?
 fi
 
-for v in PWM_CHANNEL CPU_MIN_C CPU_MAX_C SSD_MIN_C SSD_MAX_C PWM_MIN PWM_MAX \
+for v in PWM_CHANNEL CPU_MIN_C CPU_MAX_C CPU_CRIT_C SSD_MIN_C SSD_MAX_C PWM_MIN PWM_MAX \
          STEP_UP STEP_DOWN HYSTERESIS INTERVAL LOG_EVERY STALL_CYCLES; do
   [[ ${!v} =~ ^[0-9]+$ ]] || fatal "invalid configuration: $v=${!v}"
 done
-[ "$CPU_MIN_C" -lt "$CPU_MAX_C" ] && [ "$SSD_MIN_C" -lt "$SSD_MAX_C" ] \
+[ "$CPU_MIN_C" -lt "$CPU_MAX_C" ] && [ "$CPU_MAX_C" -le "$CPU_CRIT_C" ] \
+  && [ "$SSD_MIN_C" -lt "$SSD_MAX_C" ] \
   && [ "$PWM_MIN" -lt "$PWM_MAX" ] && [ "$PWM_MAX" -le 255 ] \
   || fatal "invalid configuration: inconsistent thresholds"
 
@@ -93,23 +117,42 @@ ENABLE_FILE=$IT_HWMON/pwm${PWM_CHANNEL}_enable
 FAN_FILE=$IT_HWMON/fan${PWM_CHANNEL}_input
 
 echo 1 > "$ENABLE_FILE" || fatal "cannot set manual mode"
-echo "start: $FAN_CHIP pwm$PWM_CHANNEL, CPU $CPU_MIN_C-$CPU_MAX_C C, SSD $SSD_MIN_C-$SSD_MAX_C C, PWM $PWM_MIN-$PWM_MAX"
+echo "start: $FAN_CHIP pwm$PWM_CHANNEL, CPU $CPU_MIN_C-$CPU_MAX_C C (critical $CPU_CRIT_C), SSD $SSD_MIN_C-$SSD_MAX_C C, PWM $PWM_MIN-$PWM_MAX"
 
 pwm=-1   # the first cycle goes straight to the target, with no ramp
 cycle=0
 stall=0
+boost_was=0
 while true; do
   # An unreadable or out-of-range CPU must never look "cold".
   read_int "$CORE_HWMON/temp1_input" && [ "$REPLY" -gt 0 ] && [ "$REPLY" -lt 125000 ] \
     || fatal "invalid CPU temperature: '${REPLY:-}'"
   cpu=$REPLY
-  curve "$cpu" "$CPU_MIN_C" "$CPU_MAX_C"
-  target=$REPLY
-
   read_ssd
   ssd=$REPLY
-  curve "$ssd" "$SSD_MIN_C" "$SSD_MAX_C"
+
+  if [ "$pwm" -lt 0 ]; then
+    c1=$cpu c2=$cpu s1=$ssd s2=$ssd
+  fi
+  median3 "$c1" "$c2" "$cpu"
+  cpu_m=$REPLY
+  median3 "$s1" "$s2" "$ssd"
+  ssd_m=$REPLY
+  c1=$c2 c2=$cpu s1=$s2 s2=$ssd
+
+  curve "$cpu_m" "$CPU_MIN_C" "$CPU_MAX_C"
+  target=$REPLY
+  curve "$ssd_m" "$SSD_MIN_C" "$SSD_MAX_C"
   [ "$REPLY" -gt "$target" ] && target=$REPLY
+  [ "$cpu" -ge $(( CPU_CRIT_C * 1000 )) ] && target=$PWM_MAX
+
+  read_boost
+  boost=$REPLY
+  if [ "$boost" -ne "$boost_was" ]; then
+    [ "$boost" -gt 0 ] && echo "boost: PWM at least $boost" || echo "boost over"
+    boost_was=$boost
+  fi
+  [ "$boost" -gt "$target" ] && target=$boost
 
   rpm=-1
   read_int "$FAN_FILE" && rpm=$REPLY
@@ -139,7 +182,7 @@ while true; do
   echo "$pwm" > "$PWM_FILE" || fatal "PWM write failed"
 
   if [ $(( cycle % LOG_EVERY )) -eq 0 ]; then
-    echo "cpu=$(( cpu / 1000 ))C ssd=$(( ssd / 1000 ))C target=$target pwm=$pwm rpm=$rpm"
+    echo "cpu=$(( cpu / 1000 ))C ssd=$(( ssd / 1000 ))C target=$target pwm=$pwm rpm=$rpm boost=$boost"
   fi
   cycle=$(( cycle + 1 ))
   sleep "$INTERVAL"

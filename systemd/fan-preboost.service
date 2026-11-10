@@ -1,0 +1,6 @@
+[Unit]
+Description=Fan boost ahead of the nightly backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fan-boost 1800

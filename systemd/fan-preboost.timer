@@ -1,0 +1,9 @@
+[Unit]
+Description=Fan boost ahead of the nightly backup
+
+[Timer]
+# The backup starts at 00:00: the fan gets five minutes to cool the heatsink.
+OnCalendar=*-*-* 23:55:00
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,28 @@
+#!/bin/bash
+# Raises the fan's minimum PWM for a while, ahead of a known load.
+#   fan-boost <seconds> [pwm]   boost for <seconds> (pwm: BOOST_PWM, default 160)
+#   fan-boost off               end the boost now
+set -eu
+[ -r /etc/default/fan-daemon ] && . /etc/default/fan-daemon
+BOOST_FILE=${BOOST_FILE:-/run/fan-daemon/boost}
+
+usage() {
+  echo "usage: fan-boost <seconds> [pwm] | fan-boost off" >&2
+  exit 2
+}
+
+case ${1:-} in
+  off)
+    rm -f "$BOOST_FILE"
+    ;;
+  ''|*[!0-9]*)
+    usage
+    ;;
+  *)
+    pwm=${2:-${BOOST_PWM:-160}}
+    [[ $pwm =~ ^[0-9]+$ ]] && [ "$pwm" -le 255 ] || usage
+    mkdir -p "$(dirname "$BOOST_FILE")"
+    printf '%s %s\n' "$pwm" $(( $(date +%s) + $1 )) > "$BOOST_FILE.tmp"
+    mv "$BOOST_FILE.tmp" "$BOOST_FILE"
+    ;;
+esac

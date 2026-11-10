@@ -10,17 +10,60 @@ the PWM directly from the CPU and SSD temperatures.
 Every 10 seconds the daemon:
 
 1. reads the CPU temperature (`coretemp`, package) and the SSD temperatures (`drivetemp`);
-2. calculates a PWM for each source from its own linear curve and keeps the highest;
-3. moves towards that value with a ramp:
+2. takes the median of the last three readings of each, so that a single spike is ignored;
+3. calculates a PWM for each source from its own linear curve and keeps the highest;
+4. raises it to the boost floor, if a boost is active (see [Boost before known loads](#boost-before-known-loads));
+5. moves towards that value with a ramp:
 
 | Situation | Behaviour |
 |---|---|
 | First cycle after startup | goes straight to the calculated value |
 | Temperature rising | at most +30 PWM per cycle |
-| Curve at maximum | straight to `PWM_MAX` |
+| Curve at maximum, or one raw CPU reading at `CPU_CRIT_C` | straight to `PWM_MAX` |
 | Temperature falling | at most -5 PWM per cycle, and only if the calculated value is at least 8 lower |
 
-The ramp stops short CPU temperature spikes from making the fan speed swing.
+### Why the median
+
+Sampled every 2 seconds, the CPU package temperature jumps up to 15 °C and back, in step with the
+load: the die has almost no thermal mass, so the temperature reacts within the same sample and no
+load signal gives an earlier warning. The SSD controller sensor jumps up to 12 °C in 2 seconds, often
+with no writes at all. The fan cools the heatsink, which changes over minutes, so it cannot prevent
+either kind of spike, and chasing them only makes the fan speed swing.
+
+The median of three readings (30 seconds) drops an isolated spike and follows a real rise within
+20 seconds. Replayed on recorded data, it halves how much the PWM moves per cycle. Safety still
+works on the raw reading: a single CPU reading at `CPU_CRIT_C` (90 °C) sets full speed at once.
+
+### Boost before known loads
+
+Since temperature spikes cannot be anticipated from the load, the only real head start comes from
+loads that are known in advance, such as a nightly backup. `fan-boost` raises the minimum PWM for a
+while by writing `/run/fan-daemon/boost`:
+
+```bash
+fan-boost 1800
+```
+
+```bash
+fan-boost 600 200
+```
+
+```bash
+fan-boost off
+```
+
+Without a PWM it uses `BOOST_PWM` from `/etc/default/fan-daemon` (160). The boost always has an
+expiry, so it cannot get stuck. Two pieces use it:
+
+| Piece | When | Boost |
+|---|---|---|
+| `fan-preboost.timer` | 23:55 every day | 30 minutes |
+| `fan-vzdump-hook` (vzdump `script:`) | from `job-start` to `job-end` or `job-abort` | up to 2 hours |
+
+The timer cools the heatsink for five minutes before a backup that starts at 00:00, and the hook
+keeps the boost for as long as the backup actually runs. To move the timer, override `OnCalendar`
+with `systemctl edit fan-preboost.timer`. The hook always exits 0, because a failing vzdump hook
+aborts the backup.
 
 ### Fault behaviour
 
@@ -31,6 +74,7 @@ The ramp stops short CPU temperature spikes from making the fan speed swing.
 | Fan at 0 RPM for 3 cycles | PWM at maximum and a warning in the journal |
 | Chip back in automatic mode | the daemon sets it to manual again and logs it |
 | SSD unreadable | carries on with the CPU curve only |
+| Boost file missing, malformed or expired | ignored |
 
 This means `systemctl stop fan-daemon` leaves the fan at **100%**, by design.
 To go back to the chip's curve, see [Uninstalling](#uninstalling).
@@ -75,6 +119,7 @@ installed as `/etc/default/fan-daemon`.
 | Variable | Default | Meaning |
 |---|---:|---|
 | `CPU_MIN_C` / `CPU_MAX_C` | 50 / 85 | CPU curve range, in °C |
+| `CPU_CRIT_C` | 90 | a single raw CPU reading this high sets `PWM_MAX` |
 | `SSD_MIN_C` / `SSD_MAX_C` | 45 / 70 | SSD curve range, in °C |
 | `PWM_MIN` / `PWM_MAX` | 80 / 255 | PWM limits |
 | `STEP_UP` / `STEP_DOWN` | 30 / 5 | maximum change per cycle |
@@ -83,6 +128,8 @@ installed as `/etc/default/fan-daemon`.
 | `LOG_EVERY` | 60 | cycles between status lines in the journal |
 | `STALL_CYCLES` | 3 | cycles at 0 RPM before the warning |
 | `FAN_CHIP` / `PWM_CHANNEL` | it8771 / 2 | chip and channel to drive |
+| `BOOST_PWM` | 160 | PWM floor used by `fan-boost` when none is given |
+| `BOOST_FILE` | `/run/fan-daemon/boost` | where `fan-boost` and the daemon meet |
 
 ## Installing
 
@@ -99,9 +146,13 @@ Any further arguments are passed to `ssh` and `scp`, for example to go through a
 ```
 
 The script reads the board name from the node and refuses to continue if there is no matching file
-in `config/`. It then installs the daemon, the unit and the configuration, loads the `it87` and
-`drivetemp` modules, makes them persistent in `/etc/modules-load.d/fan-daemon.conf`, enables the
-service and restarts it.
+in `config/`. It then installs the daemon, `fan-boost`, the vzdump hook, the units and the
+configuration, loads the `it87` and `drivetemp` modules, makes them persistent in
+`/etc/modules-load.d/fan-daemon.conf`, enables the timer and the service, and restarts the service.
+
+vzdump accepts a single hook script: the deploy adds `script: /usr/local/sbin/fan-vzdump-hook` to
+`/etc/vzdump.conf` only if no other script is set, and otherwise prints a warning and leaves it alone.
+A backup job that sets its own `script` overrides it.
 
 ## Testing
 
@@ -124,16 +175,21 @@ journalctl -u fan-daemon -f
 The journal gets a status line every 10 minutes:
 
 ```
-cpu=52C ssd=42C target=90 pwm=90 rpm=3260
+cpu=52C ssd=42C target=90 pwm=90 rpm=3260 boost=0
 ```
+
+The temperatures in it are the raw readings, the target already uses the median. The start and
+end of a boost are logged too.
 
 ## Uninstalling
 
 The `hwmonN` number can change, so first check which one has the name `it8771`.
 
 ```bash
-systemctl disable --now fan-daemon
+systemctl disable --now fan-preboost.timer fan-daemon
 ```
+
+Remove the `script: /usr/local/sbin/fan-vzdump-hook` line from `/etc/vzdump.conf`, then:
 
 ```bash
 grep -l it8771 /sys/class/hwmon/hwmon*/name

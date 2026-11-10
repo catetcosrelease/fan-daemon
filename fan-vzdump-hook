@@ -1,0 +1,9 @@
+#!/bin/bash
+# vzdump hook: keeps the fan boosted while a backup job runs.
+# It must always exit 0: a failing hook aborts the backup.
+FAN_BOOST=${FAN_BOOST:-/usr/local/sbin/fan-boost}
+case ${1:-} in
+  job-start) "$FAN_BOOST" "${BOOST_JOB_SECONDS:-7200}" ;;
+  job-end|job-abort) "$FAN_BOOST" off ;;
+esac > /dev/null 2>&1
+exit 0
