@@ -65,6 +65,33 @@ keeps the boost for as long as the backup actually runs. To move the timer, over
 with `systemctl edit fan-preboost.timer`. The hook always exits 0, because a failing vzdump hook
 aborts the backup.
 
+For backup jobs at other times, add a timer of your own with a shorter boost. On a node that has
+none of the job's guests the hook never fires, so a short boost wastes less there. For a job at
+06:00, 12:00 and 18:00:
+
+```ini
+# /etc/systemd/system/fan-preboost-extra.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fan-boost 900
+```
+
+```ini
+# /etc/systemd/system/fan-preboost-extra.timer
+[Timer]
+OnCalendar=*-*-* 05,11,17:55:00
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload && systemctl enable --now fan-preboost-extra.timer
+```
+
+`fan-boost off` also ends a boost set by the hook for a backup that is running: don't use it to
+test while a backup window is open.
+
 ### Fault behaviour
 
 | Event | Reaction |
