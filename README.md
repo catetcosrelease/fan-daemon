@@ -208,6 +208,32 @@ cpu=52C ssd=42C target=90 pwm=90 rpm=3260 boost=0
 The temperatures in it are the raw readings, the target already uses the median. The start and
 end of a boost are logged too.
 
+### State file
+
+On every cycle the daemon rewrites `/run/fan-daemon/state.json` atomically, for monitoring tools.
+It is world-readable:
+
+```json
+{"version":1,"updated":1795430000,"interval":10,
+ "cpu":{"raw_mc":57000,"median_mc":55000},
+ "ssd":{"raw_mc":41000,"median_mc":40000},
+ "fan":{"rpm":3426,"pwm":109,"target":105,"pwm_min":70,"pwm_max":255,"pwm_enable":1,"stalled":false},
+ "boost":{"active":false,"pwm":0,"expires":null}}
+```
+
+| Field | Meaning |
+|---|---|
+| `updated` | epoch of the last write: if it is older than three `interval`s, the daemon is not running |
+| `cpu`, `ssd` | millidegrees C: `median_mc` is what the curves use, `raw_mc` the last reading; `ssd` is `null` when no drive reports a temperature, and the highest drive otherwise |
+| `fan.rpm` | `null` if the tachometer could not be read |
+| `fan.pwm`, `fan.target` | PWM written to the chip, and the value it is ramping towards |
+| `fan.pwm_enable` | as read before the daemon corrects it: 1 is manual (normal), anything else means the chip had taken over |
+| `fan.stalled` | true after `STALL_CYCLES` cycles at 0 RPM |
+| `boost` | `expires` is an epoch, `null` with no boost |
+
+When the daemon stops, the failsafe removes the file, so a missing file means the fan is at full
+speed and nothing controls it. The format only changes together with `version`.
+
 ## Uninstalling
 
 The `hwmonN` number can change, so first check which one has the name `it8771`.

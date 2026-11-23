@@ -6,6 +6,10 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/fan-daemon
+# /run/fan-daemon holds the boost file and state.json; it must survive restarts.
+RuntimeDirectory=fan-daemon
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/local/sbin/fan-daemon.sh
 # "+" skips the sandbox: the fan goes to full speed even if ExecStart fails to start.
 ExecStopPost=+/usr/local/sbin/fan-daemon.sh --failsafe

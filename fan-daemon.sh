@@ -25,6 +25,7 @@ INTERVAL=${INTERVAL:-10}       # seconds between recalculations
 LOG_EVERY=${LOG_EVERY:-60}     # cycles between status lines in the journal
 STALL_CYCLES=${STALL_CYCLES:-3}  # cycles at 0 RPM before the fan counts as stopped
 BOOST_FILE=${BOOST_FILE:-/run/fan-daemon/boost}  # "<pwm> <expiry epoch>", written by fan-boost
+STATE_FILE=${STATE_FILE:-/run/fan-daemon/state.json}  # rewritten on every cycle, for monitoring
 
 fatal() {
   echo "ERROR: $*" >&2
@@ -44,13 +45,17 @@ read_int() {
   { IFS= read -r REPLY < "$1"; } 2>/dev/null && [[ $REPLY =~ ^-?[0-9]+$ ]]
 }
 
-# Highest temperature among all drivetemp sensors (0 if none responds).
-# The list is reread on every cycle: the module can appear after startup.
+# Highest temperature among all drivetemp sensors (0 if none responds,
+# and then have_ssd=0). The list is reread on every cycle: the module can
+# appear after startup.
 read_ssd() {
   local d n max=0
+  have_ssd=0
   for d in "$HWMON_ROOT"/hwmon*; do
     { IFS= read -r n < "$d/name"; } 2>/dev/null && [ "$n" = drivetemp ] || continue
-    read_int "$d/temp1_input" && [ "$REPLY" -gt "$max" ] && max=$REPLY
+    read_int "$d/temp1_input" || continue
+    have_ssd=1
+    [ "$REPLY" -gt "$max" ] && max=$REPLY
   done
   REPLY=$max
 }
@@ -65,15 +70,50 @@ median3() {
   REPLY=$b
 }
 
+now() {
+  REPLY=${EPOCHSECONDS:-$(date +%s)}
+}
+
 # Boost floor from BOOST_FILE, 0 if missing, malformed or expired.
+# BOOST_EXPIRES is its expiry (epoch), 0 when there is no boost.
 read_boost() {
-  local p e now
+  local p e
   REPLY=0
+  BOOST_EXPIRES=0
   { read -r p e < "$BOOST_FILE"; } 2>/dev/null || return 0
   [[ $p =~ ^[0-9]+$ && $e =~ ^[0-9]+$ ]] || return 0
-  now=${EPOCHSECONDS:-$(date +%s)}
-  [ "$now" -lt "$e" ] && REPLY=$(( p < PWM_MAX ? p : PWM_MAX ))
+  now
+  if [ "$REPLY" -lt "$e" ]; then
+    REPLY=$(( p < PWM_MAX ? p : PWM_MAX ))
+    BOOST_EXPIRES=$e
+  else
+    REPLY=0
+  fi
   return 0
+}
+
+json_or_null() {  # value: null if negative (unknown)
+  [ "$1" -ge 0 ] && REPLY=$1 || REPLY=null
+}
+
+# Atomic rewrite, so a reader never sees half a file. Temperatures in
+# millidegrees C: "median" is what the curves use, "raw" the last reading.
+write_state() {
+  local ssd_raw=null ssd_med=null fan_rpm fan_enable stalled=false
+  local boosted=false boost_exp=null
+  [ "$have_ssd" -eq 1 ] && ssd_raw=$ssd ssd_med=$ssd_m
+  json_or_null "$rpm"
+  fan_rpm=$REPLY
+  json_or_null "$enable_read"
+  fan_enable=$REPLY
+  [ "$stall" -ge "$STALL_CYCLES" ] && stalled=true
+  [ "$boost" -gt 0 ] && boosted=true boost_exp=$BOOST_EXPIRES
+  now
+  printf '{"version":1,"updated":%s,"interval":%s,"cpu":{"raw_mc":%s,"median_mc":%s},"ssd":{"raw_mc":%s,"median_mc":%s},"fan":{"rpm":%s,"pwm":%s,"target":%s,"pwm_min":%s,"pwm_max":%s,"pwm_enable":%s,"stalled":%s},"boost":{"active":%s,"pwm":%s,"expires":%s}}\n' \
+    "$REPLY" "$INTERVAL" "$cpu" "$cpu_m" "$ssd_raw" "$ssd_med" \
+    "$fan_rpm" "$pwm" "$target" "$PWM_MIN" "$PWM_MAX" "$fan_enable" "$stalled" \
+    "$boosted" "$boost" "$boost_exp" \
+    > "$STATE_FILE.tmp" 2>/dev/null && mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
 }
 
 curve() {  # temperature(mC) min(C) max(C)
@@ -91,6 +131,8 @@ failsafe() {
   find_hwmon "$FAN_CHIP" || fatal "$FAN_CHIP not found: cannot force the fan"
   echo 1 > "$REPLY/pwm${PWM_CHANNEL}_enable"
   echo 255 > "$REPLY/pwm${PWM_CHANNEL}"
+  # A stale state file would look like a healthy daemon.
+  rm -f "$STATE_FILE"
   echo "failsafe: fan at full speed"
 }
 
@@ -123,6 +165,7 @@ pwm=-1   # the first cycle goes straight to the target, with no ramp
 cycle=0
 stall=0
 boost_was=0
+state_warned=0
 while true; do
   # An unreadable or out-of-range CPU must never look "cold".
   read_int "$CORE_HWMON/temp1_input" && [ "$REPLY" -gt 0 ] && [ "$REPLY" -lt 125000 ] \
@@ -166,7 +209,9 @@ while true; do
   [ "$stall" -ge "$STALL_CYCLES" ] && target=$PWM_MAX
 
   # A chip reset (or sensors -s) can put it back in automatic mode.
-  if read_int "$ENABLE_FILE" && [ "$REPLY" -ne 1 ]; then
+  enable_read=-1
+  read_int "$ENABLE_FILE" && enable_read=$REPLY
+  if [ "$enable_read" -ge 0 ] && [ "$enable_read" -ne 1 ]; then
     echo "pwm${PWM_CHANNEL}_enable was $REPLY: back to manual"
     echo 1 > "$ENABLE_FILE" || fatal "cannot set manual mode"
   fi
@@ -180,6 +225,10 @@ while true; do
   fi
 
   echo "$pwm" > "$PWM_FILE" || fatal "PWM write failed"
+  if ! write_state && [ "$state_warned" -eq 0 ]; then
+    echo "WARNING: cannot write $STATE_FILE" >&2
+    state_warned=1
+  fi
 
   if [ $(( cycle % LOG_EVERY )) -eq 0 ]; then
     echo "cpu=$(( cpu / 1000 ))C ssd=$(( ssd / 1000 ))C target=$target pwm=$pwm rpm=$rpm boost=$boost"
